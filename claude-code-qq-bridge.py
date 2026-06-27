@@ -29,10 +29,12 @@ import subprocess
 from typing import Optional, Dict, Any
 from pathlib import Path
 
-# ================= 配置 =================
-APP_ID = ""
-CLIENT_SECRET = ""
-MASTER_OPENID = ""
+# ================= 配置（硬编码） =================
+# 正式部署前请替换为真实的 QQ Bot 凭据
+# GitHub 版本使用 .env 方式，本地直接硬编码更清晰
+APP_ID = "102888122"
+CLIENT_SECRET = "KKLNPSVZejpw4CLUep0CObp3IYo5NfyI"
+MASTER_OPENID = "FF86A54C2DFDD5A7E7B18DE4BCA2DB63"
 CLAUDE_BIN = "claude"
 TIMEOUT = 180  # claude -p 最长等 3 分钟
 
@@ -59,35 +61,10 @@ logging.basicConfig(
 logger = logging.getLogger("claude_code_bridge")
 
 
-# ---- 配置加载 ----
+# ---- 配置验证 ----
 
-def load_env():
-    """从 .env 加载配置"""
-    paths = [
-        Path(".env"),
-        Path(__file__).parent / ".env",
-        Path.cwd() / ".env",
-    ]
-    for p in paths:
-        if p.exists():
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                        if "=" in line:
-                            key, val = line.split("=", 1)
-                            os.environ[key.strip()] = val.strip().strip('"').strip("'")
-                break
-            except Exception:
-                pass
-
-    global APP_ID, CLIENT_SECRET, MASTER_OPENID
-    APP_ID = os.environ.get("APP_ID", "")
-    CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "")
-    MASTER_OPENID = os.environ.get("MASTER_OPENID", "")
-
+def verify_config():
+    """检查配置是否完整"""
     missing = []
     if not APP_ID:
         missing.append("APP_ID")
@@ -95,10 +72,8 @@ def load_env():
         missing.append("CLIENT_SECRET")
     if not MASTER_OPENID:
         missing.append("MASTER_OPENID")
-
     if missing:
         logger.error(f"Missing required config: {', '.join(missing)}")
-        logger.error("Create .env from .env.example and fill in values")
         sys.exit(1)
 
 
@@ -551,7 +526,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    load_env()
+    verify_config()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
