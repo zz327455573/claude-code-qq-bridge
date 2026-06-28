@@ -501,8 +501,45 @@ async def periodic_poll():
             logger.error(f"[Poll] error: {e}")
 
 
+def _save_master_openid(openid: str):
+    """Persist MASTER_OPENID to .env file."""
+    global MASTER_OPENID
+    if openid == MASTER_OPENID:
+        return
+    candidates = [
+        Path(".env"),
+        Path(__file__).parent / ".env",
+        Path("/root/claude-code-qq-bridge/.env"),
+    ]
+    for p in candidates:
+        if p.exists():
+            try:
+                lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+                found = False
+                for i, line in enumerate(lines):
+                    if line.startswith("MASTER_OPENID="):
+                        lines[i] = f"MASTER_OPENID={openid}\n"
+                        found = True
+                        break
+                if not found:
+                    lines.append(f"MASTER_OPENID={openid}\n")
+                p.write_text("".join(lines), encoding="utf-8")
+                MASTER_OPENID = openid
+                logger.info(f"[AutoBind] MASTER_OPENID updated -> {openid}")
+                return
+            except Exception as e:
+                logger.error(f"[AutoBind] Failed to save: {e}")
+    # Fallback: write to first candidate
+    try:
+        candidates[0].write_text(f"MASTER_OPENID={openid}\n", encoding="utf-8")
+        MASTER_OPENID = openid
+        logger.info(f"[AutoBind] MASTER_OPENID updated (new file) -> {openid}")
+    except Exception as e:
+        logger.error(f"[AutoBind] Fallback save failed: {e}")
+
+
 async def handle_c2c_message(d: dict):
-    """Handle C2C message from QQ user."""
+    """Handle C2C message from QQ user. Auto-binds to first sender."""
     global _last_msg_id, _bot_openid
     msg_id = str(d.get("id", ""))
     if not msg_id or is_duplicate(msg_id):
@@ -514,9 +551,13 @@ async def handle_c2c_message(d: dict):
         return
     _last_msg_id = msg_id
     logger.info(f"[Recv] openid={user_openid}: {content[:100]}")
-    if user_openid != MASTER_OPENID:
-        logger.info(f"[Skip] non-master openid: {user_openid}")
-        return
+
+    # Auto-bind: if MASTER_OPENID is empty or a new sender appears, adopt it
+    if not MASTER_OPENID or user_openid != MASTER_OPENID:
+        old = MASTER_OPENID
+        _save_master_openid(user_openid)
+        if old:
+            logger.warning(f"[Recv] MASTER_OPENID changed: {old} -> {user_openid}")
 
     # Approval button callback
     if content.startswith("approve:"):
@@ -577,8 +618,9 @@ async def handle_interaction(d: dict):
     if not user_openid:
         user_openid = author.get("member_openid")
     if user_openid != MASTER_OPENID:
-        logger.warning(f"[Interaction] Unauthorized: {user_openid}")
-        return
+        # Auto-bind on interaction too
+        logger.warning(f"[Interaction] Unauthorized openid: {user_openid}, treating as new master")
+        _save_master_openid(user_openid)
 
     data_block = d.get("data", {})
     button_data = data_block.get("button_data", "")
@@ -610,7 +652,10 @@ async def _heartbeat_sender(ws, interval: float):
 async def event_loop(ws):
     global _session_id, _last_seq, _running, _ws, heartbeat_task
     _ws = ws
+    _session_id = None  # clear stale session; only READY sets it
+    _last_seq = None
     heartbeat_task = asyncio.create_task(_heartbeat_sender(ws, HEARTBEAT_INTERVAL))
+    identified = False
     try:
         while _running and ws and not ws.closed:
             msg = await ws.receive()
@@ -631,9 +676,7 @@ async def event_loop(ws):
                     interval_ms = d_data.get("heartbeat_interval", 30000)
                     heartbeat_interval = interval_ms / 1000.0 * 0.8
                     logger.info(f"Hello recv, heartbeat={heartbeat_interval:.1f}s")
-                    if _session_id and _last_seq is not None:
-                        await send_resume(ws)
-                    else:
+                    if not identified:
                         await send_identify(ws)
                     continue
                 if op == 0 and t:
@@ -642,8 +685,10 @@ async def event_loop(ws):
                         _session_id = d.get("session_id")
                         user = d.get("user") if isinstance(d.get("user"), dict) else {}
                         _bot_openid = str(user.get("id", ""))
+                        identified = True
                         logger.info(f"READY, session_id={_session_id}, bot_openid={_bot_openid}")
                     elif t == "RESUMED":
+                        identified = True
                         logger.info("Session resumed")
                     elif t == "C2C_MESSAGE_CREATE":
                         task = asyncio.create_task(handle_c2c_message(d))
@@ -657,6 +702,13 @@ async def event_loop(ws):
                 break
     except Exception as e:
         logger.error(f"Event loop error: {e}")
+    finally:
+        if heartbeat_task and not heartbeat_task.done():
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
 
 
 async def main():
@@ -683,6 +735,7 @@ async def main():
         sys.exit(1)
 
     import aiohttp
+    retry_index = 0
     while _running:
         try:
             async with aiohttp.ClientSession() as session:
@@ -692,20 +745,28 @@ async def main():
                     heartbeat=HEARTBEAT_INTERVAL,
                 ) as ws:
                     logger.info("WS connected")
+                    retry_index = 0  # reset backoff on successful connect
                     await event_loop(ws)
         except asyncio.CancelledError:
             break
         except Exception as e:
             if _running:
                 logger.error(f"WS error: {e}")
-                await asyncio.sleep(RECONNECT_BACKOFF[0])
+        # Delay before reconnect (applies to both normal-exit and exception paths)
+        if _running:
+            delay = RECONNECT_BACKOFF[min(retry_index, len(RECONNECT_BACKOFF) - 1)]
+            logger.info(f"Reconnecting in {delay}s (retry={retry_index})")
+            retry_index += 1
+            await asyncio.sleep(delay)
     logger.info("Bridge stopped")
 
 
 if __name__ == "__main__":
-    if not APP_ID or not CLIENT_SECRET or not MASTER_OPENID:
-        logger.error("Missing config: APP_ID, CLIENT_SECRET, MASTER_OPENID")
+    if not APP_ID or not CLIENT_SECRET:
+        logger.error("Missing config: APP_ID, CLIENT_SECRET")
         sys.exit(1)
+    if not MASTER_OPENID:
+        logger.warning("MASTER_OPENID not set, will auto-bind on first C2C message")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
