@@ -1,9 +1,22 @@
+# 凭据
 .env
+**/.env
+
+# 日志
 logs/
+**/logs/
 *.log
+**/*.log
+
+# PM2
+.pm2/
+**/.pm2/
+
+# Python 缓存
 *.pyc
-__pycache__/
+**/__pycache__/
 *.egg-info/
+
+# 虚拟环境
 .venv/
 venv/
-.pm2/
