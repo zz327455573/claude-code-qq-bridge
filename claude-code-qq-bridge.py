@@ -539,18 +539,21 @@ def _save_master_openid(openid: str):
 
 
 async def handle_c2c_message(d: dict):
-    """Handle C2C message from QQ user. Auto-binds to first sender."""
+    """Handle C2C message from QQ user. Supports text + attachments (images/files)."""
     global _last_msg_id, _bot_openid
     msg_id = str(d.get("id", ""))
     if not msg_id or is_duplicate(msg_id):
         return
     content = str(d.get("content", "")).strip()
+    attachments = d.get("attachments") if isinstance(d.get("attachments"), list) else []
     author = d.get("author") if isinstance(d.get("author"), dict) else {}
     user_openid = str(author.get("user_openid", ""))
-    if not user_openid or not content:
+    if not user_openid:
+        return
+    if not content and not attachments:
         return
     _last_msg_id = msg_id
-    logger.info(f"[Recv] openid={user_openid}: {content[:100]}")
+    logger.info(f"[Recv] openid={user_openid}: content={content[:50]}, attachments={len(attachments)}")
 
     # Auto-bind: if MASTER_OPENID is empty or a new sender appears, adopt it
     if not MASTER_OPENID or user_openid != MASTER_OPENID:
@@ -584,9 +587,28 @@ async def handle_c2c_message(d: dict):
         await send_message_rest(user_openid, "⛔ Interrupted.")
         return
 
-    # Regular message → Claude
-    logger.info(f"[QQ -> Claude] {content}")
-    await send_to_claude(content)
+    # ── 处理图片/文件附件 ─────────────────────────────
+    attachment_lines = []
+    for att in attachments:
+        att_url = str(att.get("url", "")).strip()
+        att_type = str(att.get("content_type", "")).strip()
+        att_name = str(att.get("filename", "file")).strip()
+        if att_url:
+            if "image" in att_type:
+                attachment_lines.append(f"🖼 图片: {att_url}")
+            else:
+                attachment_lines.append(f"📎 文件: {att_url}")
+
+    # ── 组装发给 Claude 的消息 ────────────────────────
+    if content and attachment_lines:
+        claude_msg = f"{content}\n\n" + "\n".join(attachment_lines)
+    elif attachment_lines:
+        claude_msg = "用户发来了附件:\n" + "\n".join(attachment_lines)
+    else:
+        claude_msg = content
+
+    logger.info(f"[QQ -> Claude] {claude_msg[:120]}")
+    await send_to_claude(claude_msg)
 
 
 async def handle_interaction(d: dict):
