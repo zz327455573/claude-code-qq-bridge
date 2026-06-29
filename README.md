@@ -109,6 +109,15 @@ pm2 start claude-code-qq-bridge.py --name "claude-code-qq-bridge" --interpreter 
 
 ---
 
+## 🖼️ 图片/文件支持
+
+桥接器自动检测 QQ 消息中的附件（图片、文件等），提取下载 URL 转发给 Claude Code。
+
+> **注意**：桥本身只负责转发 URL，不处理图片理解。Claude Code 收到 URL 后自行下载和处理。
+> 如果需要图片识别能力，请自行配置支持视觉的 MCP Server 或使用兼容的 AI 模型。
+
+---
+
 ## 📋 安全保障
 
 - **权限隔离**：只有 `MASTER_OPENID` 的消息被响应，其余静默忽略
