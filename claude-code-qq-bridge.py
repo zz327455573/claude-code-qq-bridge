@@ -91,6 +91,9 @@ _http_client = None
 _running = False
 _last_seq: Optional[int] = None
 _last_msg_id: Optional[str] = None
+_last_typing_sent_time = 0.0  # 记录上次发送“正在输入”通知的时间戳
+_is_generating = False  # 是否处于等待 AI 响应的生成状态
+_generating_since = 0.0  # 进入生成状态的时间，超时自动 reset
 _bot_openid: str = ""
 
 
@@ -187,17 +190,17 @@ def get_session_status() -> Optional[Dict]:
 async def send_to_claude(message: str):
     """Send message to Claude Code via tmux."""
     proc = await asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-t", TMUX_SESSION, "Escape", ""
+        "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", "Escape", ""
     )
     await proc.communicate()
     await asyncio.sleep(0.3)
     proc = await asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-t", TMUX_SESSION, message, ""
+        "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", message, ""
     )
     await proc.communicate()
     await asyncio.sleep(0.1)
     proc = await asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-t", TMUX_SESSION, "Enter", ""
+        "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", "Enter", ""
     )
     await proc.communicate()
     logger.info(f"[Bridge -> Claude] {message[:100]}")
@@ -210,7 +213,7 @@ async def start_claude_in_tmux():
     """Start Claude Code in tmux. Always kills any existing Claude first."""
     # Ensure tmux session exists
     proc = await asyncio.create_subprocess_exec(
-        "tmux", "has-session", "-t", TMUX_SESSION,
+        "tmux", "has-session", "-t", f"{TMUX_SESSION}:",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     await proc.communicate()
@@ -221,26 +224,29 @@ async def start_claude_in_tmux():
         )
         await proc.communicate()
         await asyncio.sleep(1)
-    # Clear any stale input on shell line before starting Claude
-    for key in ["C-c", "C-c"]:
+
+        # Clear any stale input on shell line before starting Claude
+        for key in ["C-c", "C-c"]:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", key, ""
+            )
+            await proc.communicate()
+            await asyncio.sleep(0.2)
+        # Start fresh Claude
         proc = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", TMUX_SESSION, key, ""
+            "tmux", "send-keys", "-t", f"{TMUX_SESSION}:",
+            "cd /root && script -q -c 'claude --permission-mode auto' /dev/null", "Enter"
         )
         await proc.communicate()
-        await asyncio.sleep(0.2)
-    # Start fresh Claude
-    proc = await asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-t", TMUX_SESSION,
-        "cd /root && script -q -c 'claude --permission-mode auto' /dev/null", "Enter"
-    )
-    await proc.communicate()
-    # Wait for trust prompt, then press "1" to confirm
-    await asyncio.sleep(5)
-    proc = await asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-t", TMUX_SESSION, "1", ""
-    )
-    await proc.communicate()
-    await asyncio.sleep(3)
+        # Wait for trust prompt, then press "1" to confirm
+        await asyncio.sleep(5)
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", "1", ""
+        )
+        await proc.communicate()
+        await asyncio.sleep(3)
+
+    # 无论如何都要刷新绑定
     refresh_session()
 
 
@@ -248,7 +254,7 @@ async def stop_claude_in_tmux():
     """Stop Claude Code with Ctrl+C."""
     for key in ["C-c", "Enter", "C-c"]:
         proc = await asyncio.create_subprocess_exec(
-            "tmux", "send-keys", "-t", TMUX_SESSION, key, ""
+            "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", key, ""
         )
         await proc.communicate()
         await asyncio.sleep(0.3)
@@ -261,14 +267,14 @@ async def restart_claude_in_tmux():
     await stop_claude_in_tmux()
     await asyncio.sleep(2)
     proc = await asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-t", TMUX_SESSION,
+        "tmux", "send-keys", "-t", f"{TMUX_SESSION}:",
         "cd /root && script -q -c 'claude --permission-mode auto' /dev/null", "Enter"
     )
     await proc.communicate()
     # Wait for trust prompt, then press "1" to confirm
     await asyncio.sleep(5)
     proc = await asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-t", TMUX_SESSION, "1", ""
+        "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", "1", ""
     )
     await proc.communicate()
     await asyncio.sleep(3)
@@ -400,6 +406,37 @@ def is_duplicate(msg_id: str) -> bool:
     return False
 
 
+async def send_input_notify(user_openid: str, msg_id: str) -> bool:
+    """发送“正在输入”通知"""
+    token = await ensure_token()
+    client = get_http_client()
+    headers = {
+        "Authorization": f"QQBot {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "ClaudeCode-QQ-Bridge/3.0",
+    }
+    msg_seq = _next_msg_seq(user_openid)
+    body = {
+        "msg_type": 6,
+        "input_notify": {"input_type": 1, "input_second": 10},
+        "msg_seq": msg_seq,
+        "msg_id": msg_id,
+    }
+
+    try:
+        resp = await client.post(
+            f"{API_BASE}/v2/users/{user_openid}/messages",
+            headers=headers, json=body, timeout=30.0,
+        )
+        if resp.status_code >= 400:
+            logger.error(f"Typing notify failed [{resp.status_code}]: {resp.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"Typing notify exception: {e}")
+        return False
+
+
 async def send_message_rest(user_openid: str, content: str, *, keyboard: bool = False) -> bool:
     """Send message to QQ user. If keyboard=True, append approval buttons."""
     token = await ensure_token()
@@ -464,8 +501,20 @@ async def periodic_poll():
     """Background polling: detect approval + push replies.
     Order: JSONL text first, then approval button — so user sees
     Claude's message before being asked to approve."""
-    global _jsonl_watermark
+    global _jsonl_watermark, _is_generating, _last_typing_sent_time, _generating_since
     while True:
+        # 触发/续杯“正在输入中”的顶部状态
+        now = time.time()
+        if _is_generating and _last_msg_id and (now - _last_typing_sent_time > 2.5):
+            asyncio.create_task(send_input_notify(MASTER_OPENID, _last_msg_id))
+            _last_typing_sent_time = now
+
+        # 超时自动重置“正在输入”状态（防止卡死超过 5 分钟）
+        if _is_generating and _generating_since > 0 and (now - _generating_since > 300):
+            logger.warning(f"[Poll] _is_generating timeout ({int(now - _generating_since)}s), auto-reset")
+            _is_generating = False
+            _generating_since = 0.0
+
         await asyncio.sleep(3)
         try:
             # 0. Refresh session if process died
@@ -477,22 +526,16 @@ async def periodic_poll():
             if _log_path and Path(_log_path).exists():
                 with open(_log_path, "r", encoding="utf-8", errors="replace") as f:
                     lines = f.readlines()
-                new_lines = lines[_jsonl_watermark:]
+                curr_lines = len(lines)
+                new_lines = lines[_jsonl_watermark:curr_lines]
                 if new_lines:
-                    _jsonl_watermark = len(lines)
+                    _jsonl_watermark = curr_lines
                     for line in new_lines:
                         line = line.strip()
                         if not line:
                             continue
                         try:
                             obj = json.loads(line)
-                            actions = find_actions(obj)
-                            for act in actions:
-                                act = act.strip()
-                                if act:
-                                    logger.info(f"[Poll -> QQ Action] {act}")
-                                    await send_message_rest(MASTER_OPENID, act)
-                                    await asyncio.sleep(0.3)
                         except json.JSONDecodeError:
                             continue
                         if obj.get("type") == "assistant":
@@ -506,8 +549,15 @@ async def periodic_poll():
             # 2. Check approval status (session file)
             status = get_session_status()
             approval_pending = status and status.get("waitingFor") == "permission prompt"
+            is_idle = status and status.get("status") in ("idle", "shell")
+
+            if is_idle:
+                _is_generating = False
+                _generating_since = 0.0
 
             if approval_pending:
+                _is_generating = False  # 进入等待授权，关闭输入状态
+                _generating_since = 0.0
                 # Send text first (as normal message), then approval button (separate message)
                 if new_texts:
                     reply = "\n\n".join(new_texts)
@@ -571,7 +621,7 @@ def _save_master_openid(openid: str):
 
 async def handle_c2c_message(d: dict):
     """Handle C2C message from QQ user. Supports text + attachments (images/files)."""
-    global _last_msg_id, _bot_openid
+    global _last_msg_id, _bot_openid, _is_generating
     msg_id = str(d.get("id", ""))
     if not msg_id or is_duplicate(msg_id):
         return
@@ -584,6 +634,8 @@ async def handle_c2c_message(d: dict):
     if not content and not attachments:
         return
     _last_msg_id = msg_id
+    _is_generating = True
+    _generating_since = time.time()
     logger.info(f"[Recv] openid={user_openid}: content={content[:50]}, attachments={len(attachments)}")
 
     # Auto-bind: if MASTER_OPENID is empty or a new sender appears, adopt it
@@ -595,24 +647,28 @@ async def handle_c2c_message(d: dict):
 
     # Approval button callback
     if content.startswith("approve:"):
+        _is_generating = True
+        _generating_since = time.time()
         parts = content.split(":")
         if len(parts) >= 3:
             keystroke = {"allow": "1", "allow_always": "2", "deny": "3"}.get(parts[2])
             if keystroke:
                 logger.info(f"[Approval] Sending keystroke: {keystroke}")
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", TMUX_SESSION, keystroke, ""
+                    "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", keystroke, ""
                 )
                 await proc.communicate()
         return
 
     # Commands
     if content.strip().lower() in ["/new", "/reset", "/qingkong", "/xin duihua"]:
+        _is_generating = False
         logger.info("[Recv] New session command")
         await restart_claude_in_tmux()
         await send_message_rest(user_openid, "Session restarted.")
         return
     if content.strip().lower() in ["/stop", "/tingzhi", "/kill"]:
+        _is_generating = False
         logger.info("[Recv] Stop command")
         await stop_claude_in_tmux()
         await send_message_rest(user_openid, "⛔ Interrupted.")
@@ -684,7 +740,7 @@ async def handle_interaction(d: dict):
             keystroke = {"allow": "1", "allow_always": "2", "deny": "3"}.get(parts[2])
             if keystroke:
                 proc = await asyncio.create_subprocess_exec(
-                    "tmux", "send-keys", "-t", TMUX_SESSION, keystroke, ""
+                    "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", keystroke, ""
                 )
                 await proc.communicate()
                 logger.info(f"[Interaction] Sent keystroke: {keystroke}")
