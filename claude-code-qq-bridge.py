@@ -231,7 +231,7 @@ async def start_claude_in_tmux():
     # Start fresh Claude
     proc = await asyncio.create_subprocess_exec(
         "tmux", "send-keys", "-t", TMUX_SESSION,
-        "cd /root && script -q -c 'claude' /dev/null", "Enter"
+        "cd /root && script -q -c 'claude --permission-mode auto' /dev/null", "Enter"
     )
     await proc.communicate()
     # Wait for trust prompt, then press "1" to confirm
@@ -262,7 +262,7 @@ async def restart_claude_in_tmux():
     await asyncio.sleep(2)
     proc = await asyncio.create_subprocess_exec(
         "tmux", "send-keys", "-t", TMUX_SESSION,
-        "cd /root && script -q -c 'claude' /dev/null", "Enter"
+        "cd /root && script -q -c 'claude --permission-mode auto' /dev/null", "Enter"
     )
     await proc.communicate()
     # Wait for trust prompt, then press "1" to confirm
@@ -436,6 +436,30 @@ async def _wait_for_approval():
         await asyncio.sleep(0.5)
 
 
+def find_actions(data) -> list:
+    """深度递归搜索 JSON 结构中所有的 toolAction 或 toolSummary 字段"""
+    actions = []
+    if isinstance(data, dict):
+        ta = data.get("toolAction") or data.get("toolSummary")
+        if ta and isinstance(ta, str):
+            actions.append(ta)
+        arg_json = data.get("argumentsJson")
+        if arg_json and isinstance(arg_json, str):
+            try:
+                sub = json.loads(arg_json)
+                sub_ta = sub.get("toolAction") or sub.get("toolSummary")
+                if sub_ta and isinstance(sub_ta, str):
+                    actions.append(sub_ta)
+            except Exception:
+                pass
+        for v in data.values():
+            actions.extend(find_actions(v))
+    elif isinstance(data, list):
+        for item in data:
+            actions.extend(find_actions(item))
+    return actions
+
+
 async def periodic_poll():
     """Background polling: detect approval + push replies.
     Order: JSONL text first, then approval button — so user sees
@@ -462,6 +486,13 @@ async def periodic_poll():
                             continue
                         try:
                             obj = json.loads(line)
+                            actions = find_actions(obj)
+                            for act in actions:
+                                act = act.strip()
+                                if act:
+                                    logger.info(f"[Poll -> QQ Action] {act}")
+                                    await send_message_rest(MASTER_OPENID, act)
+                                    await asyncio.sleep(0.3)
                         except json.JSONDecodeError:
                             continue
                         if obj.get("type") == "assistant":
