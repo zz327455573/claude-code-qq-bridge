@@ -105,7 +105,7 @@ def find_current_session():
 
     best_sid = None
     best_pid = None
-    best_mtime = 0
+    best_updated = 0
 
     for sf in sessions_dir.glob("*.json"):
         try:
@@ -122,9 +122,9 @@ def find_current_session():
                 except OSError:
                     logger.debug(f"Skipping dead session: PID {pid} ({sf.name})")
                     continue
-                mtime = sf.stat().st_mtime
-                if mtime > best_mtime:
-                    best_mtime = mtime
+                updated = data.get("updatedAt", 0)
+                if updated > best_updated:
+                    best_updated = updated
                     best_sid = sid
                     best_pid = pid
         except (json.JSONDecodeError, IOError):
