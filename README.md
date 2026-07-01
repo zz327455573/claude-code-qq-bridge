@@ -61,18 +61,23 @@ graph TD
 
 ## 🚀 部署指南
 
-### 1. 准备环境
-
-- **操作系统**：Linux
-- **软件依赖**：Python 3.10+, tmux, pm2（推荐）
+### 1. 安装
 
 ```bash
-pip install -r requirements.txt
+# 从 GitHub 安装
+pip install git+https://github.com/zz327455573/claude-code-qq-bridge.git
+
+# 验证安装
+which claude-code-qq-bridge
 ```
 
-### 2. 凭据配置
+### 2. 配置
 
 ```bash
+# 交互式配置（首次使用）
+claude-code-qq-bridge --init
+
+# 或手动创建 .env
 cp .env.example .env
 ```
 
@@ -88,13 +93,11 @@ TMUX_SESSION=1
 ### 3. 运行
 
 ```bash
-python3 claude-code-qq-bridge.py
-```
+# 前台运行
+claude-code-qq-bridge
 
-推荐 PM2 保活：
-
-```bash
-pm2 start claude-code-qq-bridge.py --name "claude-code-qq-bridge" --interpreter python3
+# PM2 保活
+pm2 start $(which claude-code-qq-bridge) --name claude-code-qq-bridge
 ```
 
 ---
@@ -114,7 +117,6 @@ pm2 start claude-code-qq-bridge.py --name "claude-code-qq-bridge" --interpreter 
 桥接器自动检测 QQ 消息中的附件（图片、文件等），提取下载 URL 转发给 Claude Code。
 
 > **注意**：桥本身只负责转发 URL，不处理图片理解。Claude Code 收到 URL 后自行下载和处理。
-> 如果需要图片识别能力，请自行配置支持视觉的 MCP Server 或使用兼容的 AI 模型。
 
 ---
 
@@ -129,13 +131,13 @@ pm2 start claude-code-qq-bridge.py --name "claude-code-qq-bridge" --interpreter 
 
 ## 🔗 项目对比
 
-本项目借鉴了 [AGY-QQ-Bridge](https://github.com/zz327455573/agent_qqbot_bridge) 的架构经验：
+本项目与 [AGY-QQ-Bridge](https://github.com/zz327455573/AGY-QQ-Bridge) 共享架构经验：
 
 | 维度 | AGY-QQ-Bridge | Claude Code QQ Bridge |
 |------|---------------|----------------------|
 | 日志读取 | transcript.jsonl (`PLANNER_RESPONSE`) | JSONL (`assistant` message) |
-| 审批检测 | capture-pane TUI 文本匹配 | Session file `waitingFor` 字段 |
-| 审批回调 | Unix Socket + Hook 脚本 | QQ 按钮卡片直达 tmux |
+| 审批检测 | Session file `waitingFor` 字段 | Session file `waitingFor` 字段 |
+| 审批回调 | QQ 按钮卡片直达 tmux | QQ 按钮卡片直达 tmux |
 | 超时策略 | 5 分钟温和超时（不强杀） | 5 分钟温和超时（不强杀） |
 | 消息投递 | Escape + tmux send-keys | Escape + tmux send-keys |
 
@@ -145,9 +147,13 @@ pm2 start claude-code-qq-bridge.py --name "claude-code-qq-bridge" --interpreter 
 
 ```
 claude-code-qq-bridge/
-├── claude-code-qq-bridge.py    # 主桥接脚本
+├── src/
+│   └── claude_code_qq_bridge/
+│       ├── __init__.py
+│       ├── __main__.py
+│       └── bridge.py          # 主桥接逻辑
 ├── .env.example                # 配置模板
-├── requirements.txt            # Python 依赖
+├── pyproject.toml              # pip 包配置
 ├── .gitignore
 ├── LICENSE                     # MIT
 ├── README.md                   # 本文件

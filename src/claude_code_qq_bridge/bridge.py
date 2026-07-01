@@ -874,14 +874,44 @@ async def main():
             await asyncio.sleep(delay)
     logger.info("Bridge stopped")
 
+def cli() -> int:
+    """CLI 入口：处理 --init / --version 后运行主桥接"""
+    import sys
+    
+    if '--init' in sys.argv or (len(sys.argv) > 1 and sys.argv[1] == '--init'):
+        print('TODO: --init not yet implemented')
+        return 0
 
-if __name__ == "__main__":
+    if '--version' in sys.argv or '-V' in sys.argv:
+        print('Claude-Code-QQ-Bridge v3.0')
+        return 0
+
+    if '--help' in sys.argv or '-h' in sys.argv:
+        print('用法:')
+        print('  claude-code-qq-bridge            启动桥接服务')
+        print('  claude-code-qq-bridge --init     交互式配置（首次使用）')
+        print('  claude-code-qq-bridge --version  显示版本号')
+        print('  claude-code-qq-bridge --help     显示帮助')
+        return 0
+
+    # 检查 .env
+    env_found = any(
+        __import__('pathlib').Path(p).exists()
+        for p in ['.env', str(__import__('pathlib').Path(__file__).parent / '.env'), str(__import__('pathlib').Path.home() / '.env')]
+    )
+    if not env_found:
+        print('⚠️  未找到 .env 配置文件！')
+        print('   请先运行: claude-code-qq-bridge --init')
+        print('   或手动创建 .env 文件（参考 .env.example）')
+        return 1
+
     if not APP_ID or not CLIENT_SECRET:
-        logger.error("Missing config: APP_ID, CLIENT_SECRET")
-        sys.exit(1)
+        logger.error('Missing config: APP_ID, CLIENT_SECRET')
+        return 1
     if not MASTER_OPENID:
-        logger.warning("MASTER_OPENID not set, will auto-bind on first C2C message")
+        logger.warning('MASTER_OPENID not set, will auto-bind on first C2C message')
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Interrupted by user")
+        logger.info('Interrupted by user')
+    return 0
