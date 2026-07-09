@@ -82,12 +82,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("claude_code_bridge")
 
-# === State: single session保活 ===
-_session_id: Optional[str] = None
-_log_path: Optional[str] = None
-_pid: Optional[int] = None
-_session_file: Optional[Path] = None
-_jsonl_watermark: int = 0
+# === State: JSONL 文件跟踪（AGY 风格，不依赖 session UUID） ===
+_log_path: Optional[str] = None          # 当前绑定的 JSONL 文件路径
+_log_position: int = 0                   # 上次读取的文件位置（字节 offset）
+_log_last_mtime: float = 0.0             # 上次读取时的文件 mtime
+_jsonl_watermark: int = 0                # 兼容旧代码的 legacy watermark（不再更新）
 
 _access_token: Optional[str] = None
 _token_expires_at: float = 0.0
@@ -96,93 +95,97 @@ _http_client = None
 _running = False
 _last_seq: Optional[int] = None
 _last_msg_id: Optional[str] = None
-_last_typing_sent_time = 0.0  # 记录上次发送“正在输入”通知的时间戳
+_last_typing_sent_time = 0.0  # 记录上次发送"正在输入"通知的时间戳
 _is_generating = False  # 是否处于等待 AI 响应的生成状态
 _generating_since = 0.0  # 进入生成状态的时间，超时自动 reset
 _bot_openid: str = ""
 
 
-def find_current_session():
-    """Find the current interactive session at startup or after restart."""
+def find_latest_jsonl() -> Optional[str]:
+    """AGY 风格：扫描项目目录，找最新修改的 JSONL 文件。
+    返回绝对路径，如果没有找到则返回 None。"""
+    project_dir = Path(CLAUDE_HOME) / "projects" / CLAUDE_PROJECT
+    if not project_dir.exists():
+        return None
+    best_path = None
+    best_mtime = 0.0
+    for f in project_dir.glob("*.jsonl"):
+        try:
+            mtime = f.stat().st_mtime
+            if mtime > best_mtime:
+                best_mtime = mtime
+                best_path = str(f)
+        except OSError:
+            continue
+    return best_path
+
+
+def refresh_log_path():
+    """绑定到最新的 JSONL 文件。如果文件变了，重置读取位置。"""
+    global _log_path, _log_position, _log_last_mtime, _jsonl_watermark
+    latest = find_latest_jsonl()
+    if not latest:
+        logger.warning("[Log] No JSONL files found, waiting...")
+        return False
+    if latest != _log_path:
+        # 切换到了新文件
+        _log_path = latest
+        _log_position = 0
+        _log_last_mtime = Path(latest).stat().st_mtime
+        _jsonl_watermark = 0
+        logger.info(f"[Log] Bound to: {latest}")
+    else:
+        # 同一文件，更新 mtime
+        try:
+            _log_last_mtime = Path(latest).stat().st_mtime
+        except OSError:
+            pass
+    return True
+
+
+def check_log_rotation() -> bool:
+    """检查是否有更新的 JSONL 文件出现（比如 restart 后新建的 session），
+    有则自动切换。返回 True 表示可以继续轮询，False 暂时没有可用文件。"""
+    global _log_path, _log_position, _log_last_mtime, _jsonl_watermark
+    latest = find_latest_jsonl()
+    if not latest:
+        return False
+    if latest != _log_path:
+        logger.info(f"[Log] Newer log detected: {latest}, switching...")
+        _log_path = latest
+        _log_position = 0
+        _log_last_mtime = Path(latest).stat().st_mtime
+        _jsonl_watermark = 0
+        logger.info(f"[Log] Switched to: {latest}")
+    return True
+
+
+def get_session_file_from_log() -> Optional[Path]:
+    """从当前 JSONL 文件推导 sessionId，再在 sessions 目录找对应的 session 文件。"""
+    if not _log_path:
+        return None
+    log_name = Path(_log_path).stem  # session UUID
     sessions_dir = Path(CLAUDE_HOME) / "sessions"
     if not sessions_dir.exists():
-        return None, None, None
-
-    best_sid = None
-    best_pid = None
-    best_updated = 0
-
+        return None
     for sf in sessions_dir.glob("*.json"):
         try:
             with open(sf) as f:
                 data = json.load(f)
-            pid = data.get("pid")
-            sid = data.get("sessionId")
-            kind = data.get("kind", "")
-            entrypoint = data.get("entrypoint", "")
-            if pid and sid and kind == "interactive" and entrypoint in ("cli", "sdk-ts"):
-                # Skip zombie: verify process is actually alive
-                try:
-                    os.kill(pid, 0)
-                except OSError:
-                    logger.debug(f"Skipping dead session: PID {pid} ({sf.name})")
-                    continue
-                updated = data.get("updatedAt", 0)
-                if updated > best_updated:
-                    best_updated = updated
-                    best_sid = sid
-                    best_pid = pid
+            if data.get("sessionId") == log_name:
+                return sf
         except (json.JSONDecodeError, IOError):
             continue
-
-    if not best_sid:
-        return None, None, None
-
-    log_path = str(Path(CLAUDE_HOME) / "projects" / CLAUDE_PROJECT / f"{best_sid}.jsonl")
-    return best_sid, log_path, best_pid
-
-
-def refresh_session():
-    """Refresh session location after startup or restart."""
-    global _session_id, _log_path, _pid, _session_file, _jsonl_watermark
-    sid, log_path, pid = find_current_session()
-    if sid:
-        if _session_id is None or sid != _session_id:
-            # New session or first init → skip old JSONL, only push new messages
-            _jsonl_watermark = _count_jsonl_lines(log_path)
-        _session_id = sid
-        _log_path = log_path
-        _pid = pid
-        _session_file = Path(CLAUDE_HOME) / "sessions" / f"{pid}.json"
-        logger.info(f"Session: {sid} (PID: {pid})")
-        logger.info(f"Log: {log_path} (watermark={_jsonl_watermark})")
-        return True
-    return False
-
-
-def _count_jsonl_lines(path: str) -> int:
-    """Count lines in JSONL file without loading content."""
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return sum(1 for _ in f)
-    except IOError:
-        return 0
-
-
-def maybe_refresh_session() -> bool:
-    """Refresh session if the current session file disappeared (Claude Code restarted)."""
-    if _session_file and not _session_file.exists():
-        logger.info("Session file gone, refreshing...")
-        return refresh_session()
-    return True
+    return None
 
 
 def get_session_status() -> Optional[Dict]:
     """Read session file for waitingFor field."""
-    if not _session_file or not _session_file.exists():
+    session_file = get_session_file_from_log()
+    if not session_file or not session_file.exists():
         return None
     try:
-        with open(_session_file) as f:
+        with open(session_file) as f:
             data = json.load(f)
         return {
             "status": data.get("status"),
@@ -251,8 +254,8 @@ async def start_claude_in_tmux():
         await proc.communicate()
         await asyncio.sleep(3)
 
-    # 无论如何都要刷新绑定
-    refresh_session()
+    # 刷新绑定到最新的 JSONL 文件
+    refresh_log_path()
 
 
 async def stop_claude_in_tmux():
@@ -267,23 +270,58 @@ async def stop_claude_in_tmux():
 
 
 async def restart_claude_in_tmux():
-    """Restart Claude Code (kill and start new)."""
+    """Restart Claude Code: kill old tmux session, start fresh (AGY style)."""
+    global _log_path, _log_position, _log_last_mtime, _jsonl_watermark
     logger.info("Restarting Claude Code...")
-    await stop_claude_in_tmux()
-    await asyncio.sleep(2)
+
+    # 1. 强杀整个 tmux 会话（AGY 方案，clean state）
+    proc = await asyncio.create_subprocess_shell(
+        f"tmux kill-session -t {TMUX_SESSION} 2>/dev/null || true"
+    )
+    await proc.communicate()
+    await asyncio.sleep(0.5)
+
+    # 2. 重建 tmux 会话
+    proc = await asyncio.create_subprocess_exec(
+        "tmux", "new-session", "-d", "-s", TMUX_SESSION
+    )
+    await proc.communicate()
+    await asyncio.sleep(1)
+
+    # 3. 清除可能残留的输入
+    for key in ["C-c", "C-c"]:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", key, ""
+        )
+        await proc.communicate()
+        await asyncio.sleep(0.2)
+
+    # 4. 启动全新 Claude
     proc = await asyncio.create_subprocess_exec(
         "tmux", "send-keys", "-t", f"{TMUX_SESSION}:",
         "cd /root && script -q -c 'claude --permission-mode auto' /dev/null", "Enter"
     )
     await proc.communicate()
-    # Wait for trust prompt, then press "1" to confirm
     await asyncio.sleep(5)
     proc = await asyncio.create_subprocess_exec(
         "tmux", "send-keys", "-t", f"{TMUX_SESSION}:", "1", ""
     )
     await proc.communicate()
-    await asyncio.sleep(3)
-    refresh_session()
+
+    # 4. 记录旧文件路径以便检测新文件产生
+    old_log = _log_path
+    for attempt in range(15):  # up to ~30 seconds
+        await asyncio.sleep(2)
+        latest = find_latest_jsonl()
+        if latest and latest != old_log:
+            _log_path = latest
+            _log_position = 0
+            _log_last_mtime = Path(latest).stat().st_mtime
+            logger.info(f"[Restart] New log detected: {latest}")
+            break
+    else:
+        logger.warning(f"[Restart] Timed out waiting for new log, staying on {_log_path}")
+
     logger.info("Claude Code restarted")
 
 
@@ -412,7 +450,7 @@ def is_duplicate(msg_id: str) -> bool:
 
 
 async def send_input_notify(user_openid: str, msg_id: str) -> bool:
-    """发送“正在输入”通知"""
+    """发送"正在输入"通知"""
     token = await ensure_token()
     client = get_http_client()
     headers = {
@@ -506,15 +544,15 @@ async def periodic_poll():
     """Background polling: detect approval + push replies.
     Order: JSONL text first, then approval button — so user sees
     Claude's message before being asked to approve."""
-    global _jsonl_watermark, _is_generating, _last_typing_sent_time, _generating_since
+    global _jsonl_watermark, _is_generating, _last_typing_sent_time, _generating_since, _log_position
     while True:
-        # 触发/续杯“正在输入中”的顶部状态
+        # 触发/续杯"正在输入中"的顶部状态
         now = time.time()
         if _is_generating and _last_msg_id and (now - _last_typing_sent_time > 2.5):
             asyncio.create_task(send_input_notify(MASTER_OPENID, _last_msg_id))
             _last_typing_sent_time = now
 
-        # 超时自动重置“正在输入”状态（防止卡死超过 5 分钟）
+        # 超时自动重置"正在输入"状态（防止卡死超过 5 分钟）
         if _is_generating and _generating_since > 0 and (now - _generating_since > 300):
             logger.warning(f"[Poll] _is_generating timeout ({int(now - _generating_since)}s), auto-reset")
             _is_generating = False
@@ -522,20 +560,19 @@ async def periodic_poll():
 
         await asyncio.sleep(3)
         try:
-            # 0. Refresh session if process died
-            if not maybe_refresh_session():
+            # 0. Check for log rotation (newer JSONL file appeared)
+            if not check_log_rotation():
                 continue
 
             # 1. Read JSONL for new assistant replies (BEFORE approval check)
             new_texts = []
             if _log_path and Path(_log_path).exists():
                 with open(_log_path, "r", encoding="utf-8", errors="replace") as f:
-                    lines = f.readlines()
-                curr_lines = len(lines)
-                new_lines = lines[_jsonl_watermark:curr_lines]
-                if new_lines:
-                    _jsonl_watermark = curr_lines
-                    for line in new_lines:
+                    f.seek(_log_position)
+                    new_data = f.read()
+                    _log_position = f.tell()
+                if new_data:
+                    for line in new_data.splitlines():
                         line = line.strip()
                         if not line:
                             continue
@@ -832,10 +869,7 @@ async def main():
 
     # 1. Start Claude Code in tmux
     await start_claude_in_tmux()
-    if not _session_id:
-        logger.warning("No Claude Code session found, retrying in 10s...")
-        await asyncio.sleep(10)
-        refresh_session()
+    # refresh_log_path() is called inside start_claude_in_tmux()
 
     # 2. Start background polling
     asyncio.create_task(periodic_poll())
