@@ -1,5 +1,7 @@
 # Claude Code QQ Bridge 🚀
 
+[![Agent Keep](https://img.shields.io/badge/🏠_Agent_Keep-生态项目-blue)](https://github.com/zz327455573/agent-keep)
+
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![QQ Bot](https://img.shields.io/badge/QQ-Bot%20API-red.svg)](https://bot.q.qq.com/)
